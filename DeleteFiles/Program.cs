@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using Utility;
 using Microsoft.SharePoint;
-using System.IO;
+using log4net;
+using System.Reflection;
 
 namespace DeleteFiles
 {
@@ -14,21 +14,24 @@ namespace DeleteFiles
   /// </summary>
   public class Program
   {
-    static StreamWriter writer = null;
+    //private static StreamWriter _writer;
+    private static readonly ILog Log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
 
     public static void Main(string[] args)
     {
       try
       {
+        log4net.Config.XmlConfigurator.Configure();
+
         CommandArgs commandArgs = CommandLine.Parse(args);
         Dictionary<string, string> dict = commandArgs.ArgPairs;
 
-        string url = string.Empty;
+        string url;
         bool recursive = false;
         bool preview = false;
-        string mask = string.Empty;
-        string outfile = string.Empty;
-        bool all = false;
+        string contains = string.Empty;
+        const bool all = false;
+        bool quiet = false;
 
         if (dict.ContainsKey("url"))
         {
@@ -36,12 +39,14 @@ namespace DeleteFiles
           if (url.Length < 1)
           {
             Usage();
+            Log.Info("Missing -url parameter");
             return;
           }
         }
         else
         {
           Usage();
+          Log.Info("Missing -url parameter");
           return;
         }
 
@@ -54,54 +59,60 @@ namespace DeleteFiles
           preview = true;
         }
 
-        if (dict.ContainsKey("mask"))
+        if (dict.ContainsKey("contains"))
         {
-          mask = dict["mask"];
+          contains = dict["contains"];
+        }
+        else
+        {
+          Usage();
+          Log.Info("Missing -contains parameter");
+          return;
         }
 
         if (dict.ContainsKey("outfile"))
         {
-          outfile = dict["outfile"];
-          writer = new StreamWriter(outfile, true);
+          var outfile = dict["outfile"];
         }
 
-        if (!preview)
+        if (dict.ContainsKey("quiet"))
         {
-          Console.Write("Are you really sure you want to delete these files? (Y/N)");
-          string result = Console.ReadLine();
-          if (!result.ToLower().Contains('y'))
-          {
-            return;
-          }
+          quiet = true;
         }
 
-        Console.WriteLine("Searching...");
-
-        DeleteFiles(url, recursive, mask, preview, all);
-
-        if (writer != null)
+        if (!preview && !quiet)
         {
-          writer.Close();
-          writer.Dispose();
+          Console.Write("Are you really sure you want to delete files? (Y/N)");
+          var result = Console.ReadLine();
+          if (result != null)
+            if (!result.ToLower().Contains('y'))
+            {
+              return;
+            }
         }
+        Log.Info(string.Format("Started with paramers: {0}", string.Join(" ", args)));
 
-        Console.WriteLine("Done.");
+        Log.Info("Searching...");
+        DeleteFiles(url, recursive, contains, preview, all, quiet);
+
+        Log.Info("Done.");
       }
       catch (Exception ex)
       {
-        Console.WriteLine("Error: " + ex.Message);
-        if (ex.InnerException != null)
-        {
-          Console.WriteLine("ErrorInner exception: " + ex.InnerException.Message);
-        }
+        Log.Error("Error: ", ex);
       }
     }
 
-    private static void DeleteFiles(string url, bool recursive, string fileMask, bool preview, bool deleteAll)
+    private static void DeleteFiles(string url,
+                                    bool recursive,
+                                    string fileMask,
+                                    bool preview,
+                                    bool deleteAll,
+                                    bool quiet)
     {
-      using (SPSite site = new SPSite(url))
+      using (var site = new SPSite(url))
       {
-        IterateWeb(site.RootWeb, recursive, fileMask, preview, deleteAll);
+        IterateWeb(site.RootWeb, recursive, fileMask, preview, deleteAll, quiet);
       }
     }
 
@@ -113,79 +124,138 @@ namespace DeleteFiles
     /// <param name="fileMask"></param>
     /// <param name="preview"></param>
     /// <param name="deleteAll"></param>
-    private static void IterateWeb(SPWeb web, bool recursive, string fileMask, bool preview, bool deleteAll)
+    private static void IterateWeb(SPWeb web,
+                                    bool recursive,
+                                    string fileMask,
+                                    bool preview,
+                                    bool deleteAll,
+                                    bool quiet)
     {
+      DeleteFromWeb(web, deleteAll, fileMask, preview, quiet);
+      if (!recursive) return;
+
       foreach (SPWeb subWeb in web.Webs)
       {
-        for (int listIndex = 0; listIndex < subWeb.Lists.Count; listIndex++)
+        Log.Debug(string.Format("Iterating sub web {0}", subWeb.Url));
+        IterateWeb(subWeb, true, fileMask, preview, deleteAll, quiet);
+        subWeb.Dispose();
+      }
+    }
+
+    private static SPListItemCollection GetItems(SPList list, string fileMask)
+    {
+      var queryString = string.Format(@"<Where>
+      <Contains>
+         <FieldRef Name='FileLeafRef' />
+         <Value Type='File'>{0}</Value>
+      </Contains>
+   </Where>", fileMask);
+      var spQuery = new SPQuery
+                      {
+                        Query = queryString,
+                        ViewFields = "<FieldRef Name='ID'></FieldRef>",
+                        ViewAttributes = "Scope=\"Recursive\""
+                      };
+      return list.GetItems(spQuery);
+    }
+
+    private static bool DeleteFromWeb(SPWeb subWeb,
+                                      bool deleteAll,
+                                      string fileMask,
+                                      bool preview,
+                                      bool quiet)
+    {
+      var uri = new Uri(subWeb.Url);
+
+      Log.Debug("Iterating lists...");
+      for (var listIndex = 0; listIndex < subWeb.Lists.Count; listIndex++)
+      {
+        var list = subWeb.Lists[listIndex];
+        Log.Debug(string.Format("Searching list {0}/{1}...", list.ParentWebUrl, list.Title));
+
+        if (list.BaseTemplate != SPListTemplateType.DocumentLibrary)
         {
-          SPList list = subWeb.Lists[listIndex];
-          SPDocumentLibrary docLib = list as SPDocumentLibrary;
-          if (docLib == null)
+          Log.Debug("Not a Document Library, skipping.");
+          continue;
+        }
+
+        SPListItemCollection items = GetItems(list, fileMask); //list.Items;
+        if (items == null)
+        {
+          Log.Debug("No matching items found.");
+          continue;
+        }
+
+        for (var i = 0; i < items.Count; i++)
+        {
+          SPListItem item = items[i]; //list.Items[i];
+
+          Log.Debug(string.Format("Checking list item {0}/{1}...", item.File.ParentFolder.ServerRelativeUrl, item.Name));
+
+          bool deleteIt = deleteAll;
+
+          //if (item.File == null) continue;
+          //if (fileMask.Length > 0)
+          //{
+          //  if (!FindFilesPatternToRegex.Convert(fileMask).IsMatch(item.File.Name))
+          //  {
+          //    Log.Debug(string.Format("{0}/{1} doesn't match the file mask. Skipping this item...", item.File.ParentFolder.ServerRelativeUrl, item.File.Name));
+          //    continue;
+          //  }
+          //}
+
+          var info = string.Format("{0}://{1}{2}/{3}", uri.Scheme, uri.Host, item.File.ParentFolder.ServerRelativeUrl, item.File.Name);
+
+          if (quiet)
           {
-            continue;
+            deleteAll = true;
+            deleteIt = true;
           }
 
-          for (int i = list.Items.Count - 1; i >= 0; i--)
+          if (!deleteAll)
           {
-            SPListItem item = list.Items[i];
-
-            bool deleteIt = deleteAll;
-
-            if (item.File != null)
+            Log.Debug("Asking user for input");
+            Console.Write("Do you want to delete {0}? ([Y]es/[N]o/Yes [A]ll)", info);
+            string response = Console.ReadLine();
+            Log.Debug(string.Format("User respone: {0}", response));
+            if (response != null)
             {
-              if (fileMask.Length > 0)
+              if (response.ToLower().Contains("a"))
               {
-                if (!item.File.Name.ToLower().Contains(fileMask.ToLower()))
-                {
-                  continue;
-                }
+                deleteIt = true;
+                deleteAll = true;
               }
-
-              string info = string.Format("{0}/{1}/{2}", item.ParentList.ParentWeb.Url, item.ParentList.Title, item.File.Name);
-              if (!deleteAll)
+              if (response.ToLower().Contains("y"))
               {
-                Console.Write("Do you want to delete {0}? ([Y]es/[N]o/Yes [A]ll)", info);
-                string response = Console.ReadLine();
-                if (response.ToLower().Contains("a"))
-                {
-                  deleteIt = true;
-                  deleteAll = true;
-                }
-                if (response.ToLower().Contains("y"))
-                {
-                  deleteIt = true;
-                }
-              }
-              else
-              {
-                Console.WriteLine(info);
-              }
-
-
-              if (!preview && deleteIt)
-              {
-                // DELETE IT
-                list.Items.DeleteItemById(item.ID);
-
-                Console.WriteLine("DELETED");
-
-                if (writer != null)
-                {
-                  writer.WriteLine("{0}\t{1}", DateTime.Now.ToString(), info);
-                  writer.Flush();
-                }
-
+                deleteIt = true;
               }
             }
           }
+
+          if (deleteIt)
+          {
+            Log.Info(string.Format("{0} Deleting {1}", preview ? "[PREVIEW]" : "", info));
+          }
+
+
+          if (preview || !deleteIt) continue;
+
+          // DELETE IT
+          Log.Debug(string.Format("Trying to delete item {0}", item.Name));
+          if (item.File.CheckOutStatus == SPFile.SPCheckOutStatus.None)
+          {
+            list.Items.DeleteItemById(item.ID);
+            Log.Debug(string.Format("Item {0} deleted", item.Name));
+          }
+          else
+          {
+            Log.Info(string.Format("File {0} is checked out, skipped.", item.Name));
+          }
+
+          //Log.Info(info);
         }
-        if (recursive)
-        {
-          IterateWeb(subWeb, recursive, fileMask, preview, deleteAll);
-        }
-        subWeb.Dispose();
       }
+      return deleteAll;
     }
 
     /// <summary>
@@ -197,15 +267,20 @@ namespace DeleteFiles
       Console.WriteLine("DeleteFiles.exe -url <website> ");
       Console.WriteLine("  [-recursive]");
       Console.WriteLine("  [-preview]");
-      Console.WriteLine("  [-mask] <value>");
+      Console.WriteLine("  [-contains] <value>");
       Console.WriteLine("  [-outfile <filename>]");
+      Console.WriteLine("  [-quiet]");
       Console.WriteLine();
       Console.WriteLine();
-      Console.WriteLine("  -url <url>\t\tThe URL to request.");
-      Console.WriteLine("  -recursive\tWill iterate all sub sites.");
-      Console.WriteLine("  -recursive\tWill do a preview instead of delete.");
-      Console.WriteLine("  -mask <value>\tFile mask value.");
+      Console.WriteLine("  -url <url>\t\tThe URL to process.");
+      Console.WriteLine("  -recursive\t\tWill iterate all sub sites.");
+      Console.WriteLine("  -preview\t\tWill do a preview instead of delete.");
+      Console.WriteLine("  -contains <value>\tFile name contains value. (Remark: It's not a file mask, it's a string comparison with the 'containing' method)");
       Console.WriteLine("  -outfile <filename>\tWill write the result to a logfile.");
+      Console.WriteLine("  -quiet \t\tWill silently answer Yes to all delete questions.");
+      Console.WriteLine("");
+      Console.WriteLine("Example, to delete all PDF files from a site:");
+      Console.WriteLine("DeleteFiles.exe -url http://intranet -recursive -contains .pdf");
     }
 
   }
