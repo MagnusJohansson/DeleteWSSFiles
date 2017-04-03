@@ -1,7 +1,4 @@
 # DeleteWSSFiles
-This small utility will delete files and documents from a site collection from SharePoint or MOSS 2007.
-
-
 This small command line utility is used for deleting files and documents from a SharePoint or MOSS 2007 site collection.
 
 ## Usage
